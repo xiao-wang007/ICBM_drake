@@ -70,11 +70,19 @@ def generalized_dynamics_constraint(plant, contextList, decVars, contactPairs):
 	for ti in range(decVars.shape[1]):
 
 """
+Some utility functions
+"""
+def AutoDiffArrayEqual(self, a, b):
+	return np.array_equal(a, b) and np.array_equal(ExtractGradient(a), ExtractGradient(b))
+
+"""
 "A class for the case"
 """
 
 class Push3D(object):
-	def __init__(self, stepSize, nStep, tabelFile, pandaFile, boxFile, tipFile=None):
+	def __init__(self, stepSize, nStep, tabelFile, \
+				 pandaFile, boxFile, tipFile=None, \
+				 X_W_table=None, X_table_pandaBase=None):
 		self.builder = DiagramBuilder()
 		self.N = nStep
 		self.plant, self.scene_graph = AddMultibodyPlantSceneGraph(self.builder, time_step=stepSize)
@@ -82,13 +90,18 @@ class Push3D(object):
 							   "panda"     : parser.AddModels(pandaFile)[0], \
 							   "box"       : parser.AddModels(boxFile)[0],
 							   "tip"	   : parser.AddModels(tipFile)[0]}
+		self.SetTheScene(X_W_table, X_table_pandaBase)
 
 	def SetTheScene(self, X_W_table, X_table_pandaBase):
 		table_top_frame = self.plant.GetFrameByName("table_top_center")
 		robot_base_frame = self.plant.GetFrameByName("panda_link0")
 		box_base_frame = self.plant.GetFrameByName("base_link_cracker")
-		self.plant.WeldFrames(self.plant.world_frame(), table_top_frame, X_W_table)
-		self.plant.WeldFrames(table_top_frame, robot_base_frame, X_table_pandaBase)
+
+		if X_W_table is not None:
+			self.plant.WeldFrames(self.plant.world_frame(), table_top_frame, X_W_table)
+		if X_table_pandaBase is not None:
+			self.plant.WeldFrames(table_top_frame, robot_base_frame, X_table_pandaBase)
+
 		self.plant.Finalize()
 		self.plant.set_name("Push3D")
 
@@ -104,36 +117,50 @@ class Push3D(object):
 		self.prog = MathematicalProgram()
 		self.nDecVar_ti = nq + nv + nu + nContact*(nBasis+1+1) # the offset for indexing
 		nDecVar = (nq + nv + nu + nContact*(nBasis+1+1))*self.N
+		self.nContactParams = nContact * (nBasis + 1 + 1)
 
 		if case == "jointspace":
 			# -2 is to offset the two fixed panda fingers
-			nq = self.plant.num_positions(self.modelInstances["panda"])	- 2 + \
+			self.nq = self.plant.num_positions(self.modelInstances["panda"])	- 2 + \
 				 self.plant.num_positions(self.modelInstances["box"])
-			nv = self.plant.num_velocities(self.modelInstances["panda"]) - 2 + \
+			self.nv = self.plant.num_velocities(self.modelInstances["panda"]) - 2 + \
 				 self.plant.num_velocities(self.modelInstances["box"])
-			nu = self.plant.num_actuators(self.modelInstances["panda"])
+			self.nu = self.plant.num_actuators(self.modelInstances["panda"])
 
-			# notice here, decVars is 1D vector
-			self.decVars = self.plant.NewContinuousVariables(nDecVar, "decision_variable_set")
+			self.qVars = self.prog.NewContinuousVariables(self.nq, self.N, "positions")
+			self.vVars = self.prog.NewContinuousVariables(self.nv, self.N, "velocities")
+			self.uVars = self.prog.NewContinuousVariables(self.nu, self.N, "actuations")
+			self.contactVars = self.prog.NewContinuousVariables(self.nContactParams, N, "lambdas&slack")
+			# 1 is for fn, 1 is for slack
 
 		elif case == "taskspace":
-			nq = self.plant.num_positions(self.modelInstances["tip"])	+ \
-				 self.plant.num_positions(self.modelInstances["box"])
-			nv = self.plant.num_velocities(self.modelInstances["tip"]) + \
-				 self.plant.num_velocities(self.modelInstances["box"])
-			nu = self.plant.num_actuators(self.modelInstances["tip"])
+			self.nq = self.plant.num_positions(self.modelInstances["tip"])	+ \
+				 	  self.plant.num_positions(self.modelInstances["box"])
+			self.nv = self.plant.num_velocities(self.modelInstances["tip"])  + \
+				 	  self.plant.num_velocities(self.modelInstances["box"])
+			self.nu = self.plant.num_actuators(self.modelInstances["tip"])
 
-			self.qVars = self.prog.NewContinuousVariables(nq, self.N, "positions")
-			self.vVars = self.prog.NewContinuousVariables(nv, self.N, "velocities")
-			self.uVars = self.prog.NewContinuousVariables(nu, self.N, "actuations")
-
-			self.decVars = self.plant.NewContinuousVariables(nDecVar, "decision_variable_set")
+			self.qVars = self.prog.NewContinuousVariables(self.nq, self.N, "positions")
+			self.vVars = self.prog.NewContinuousVariables(self.nv, self.N, "velocities")
+			self.uVars = self.prog.NewContinuousVariables(self.nu, self.N, "actuations")
+			self.contactVars = self.prog.NewContinuousVariables(self.nContactParams, N, "lambdas&slack")
 
 	def SetBoundaryConditions(self, decVars_t0, decVars_tf=None):
-		self.decVars[0:self.ndecVars_ti] = decVars_t0
+		"""
+		Sets the boundary conditions.
+		
+		:param      decVars_t0:  initial condition 
+		:type       decVars_t0:  { 1D array}
+		:param      decVars_tf:  final condition
+		:type       decVars_tf:  { 1D array }
+		"""
+
+		self.qVars[:, 0], self.vVars[:, 0], self.uVars[:, 0], self.contactVars[:, 0] = \ 
+			np.split(decVars_t0, [self.nq, self.nq+self.nv, self.nq+self.nv+self.nContactParams])
 
 		if decVars_tf is not None:
-			self.decVars[-self.nDecVar_ti: ] = decVars_tf
+			self.qVars[:, -1], self.vVars[:, -1], self.uVars[:, -1], self.contactVars[:, -1] = \ 
+			np.split(decVars_tf, [self.nq, self.nq+self.nv, self.nq+self.nv+self.nContactParams])
 
 	def SceneVisualizer(self, context_index=None):
 		# this is intended for visualization of the trajectory
@@ -148,7 +175,7 @@ class Push3D(object):
 		:type       cst_list:  { type_description }
 		"""
 		for cst in cst_list:
-			self.prog.AddConstraint(cst, lb=cst.lb, ub=cst.ub, vars=self.decVars[cst.indices])
+			self.prog.AddConstraint(cst, lb=cst.lb, ub=cst.ub, vars=)
 
 	def SetObjective(self, indices):
 		"""
@@ -165,5 +192,67 @@ class Push3D(object):
 		else:
 			pass # zeros init
 
-	def AutoDiffArrayEqual(self, a, b):
-    	return np.array_equal(a, b) and np.array_equal(ExtractGradient(a), ExtractGradient(b))
+    def SystemDynamicConstraint(self, vars, context_index, conPairs):
+    	v, q_next, v_next, u_next, lambdasAndSlack_next = np.split(vars, \
+    					[self.nv, self.nv+self.nq, self.nq+self.nv+self.nv, self.nq+self.nv+self.nv+self.nu])
+    	if isinstance(vars[0], AutoDiffXd):
+			if not autoDiffArrayEqual(v, self.ad_plant.GetVelocities(self.mutable_context_list[context_index])):
+				self.ad_plant.SetVelocities(self.mutable_context_list[context_index], v)
+			if not autoDiffArrayEqual(q_next, self.ad_plant.GetPositions(self.mutable_context_list[context_index+1])):
+				self.ad_plant.SetPositions(self.mutable_context_list[context_index+1], q_next)
+			if not autoDiffArrayEqual(v_next, self.ad_plant.GetVelocities(self.mutable_context_list[context_index+1])):
+				self.ad_plant.SetVelocities(self.mutable_context_list[context_index+1], v_next)
+
+			B = self.ad_plant.MakeActuationMatrix()
+			y = B @ u_next
+
+			G_next = self.ad_plant.CalcGravityGeneralizedForces(self.mutable_context_list[context_index+1])
+			y += G_next
+
+			C_next = self.ad_plant.CalcBiasTerm(self.mutable_context_list[context_index+1])
+			y -= C_next
+
+			M_next = self.ad_plant.CalcMassMatrixViaInverseDynamics(self.mutable_context_list[context_index+1])
+
+			# now loop to get contact Jacobians
+			for 
+				Jv_V_W_Cbox = eval_plant.CalcJacobianSpatialVelocity(eval_plant_context, 
+                                                      JacobianWrtVariable.kV, 
+                                                      frame_box, 
+                                                      p_in_box, 
+                                                      eval_plant.world_frame(), 
+                                                      eval_plant.world_frame())
+
+		else:
+			pass
+
+"""
+To be used to get the system input, i.e. torques
+
+The following snippet shows how per model instance actuation can be set:
+Click to expand C++ code...
+
+ModelInstanceIndex model_instance_index = ...;
+VectorX<T> u_instance(plant.num_actuated_dofs(model_instance_index));
+int offset = 0;
+for (JointActuatorIndex joint_actuator_index :
+plant.GetJointActuatorIndices(model_instance_index)) {
+const JointActuator<T>& actuator = plant.get_joint_actuator(
+joint_actuator_index);
+const Joint<T>& joint = actuator.joint();
+VectorX<T> u_joint = ... my_actuation_logic_for(joint) ...;
+ASSERT(u_joint.size() == joint_actuator.num_inputs());
+u_instance.segment(offset, u_joint.size()) = u_joint;
+offset += u_joint.size();
+}
+plant.get_actuation_input_port(model_instance_index).FixValue(
+plant_context, u_instance);
+
+
+"""
+
+
+
+
+
+

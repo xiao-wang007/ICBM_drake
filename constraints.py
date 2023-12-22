@@ -1,17 +1,11 @@
 """
-Constraint class should have the function to produce the indices for decVars
+Constraints will be implemented as functions for the ease of use
 """
+def SystemDynamicConstraint(vars, context_index, plant, context_list, nq, nv, nu):
+	v, q_next, v_next, u_next, lambdasAndSlack = np.split(vars, [nv, nv+nq, nq+nv+nv, nq+nv+nv+nu])
 
-class DynamicConstraint(object):
-	def __init__(self, contact_pairs, ndecVars_ti, N):
-		self.contact_pairs = contact_pairs
-		self.ndecVars_ti = ndecVars_ti
-		self.N = N
-
-	def Evaluator(self, plant, context_list, decVars_vec, ndecVars_ti, N):
-		# reshape the 1D decVar to 2D with shape: ndecVars_ti  nTimes
-		decVars_mat = decVars_vec.reshape((self.ndecVars_ti, self.N), order='F')
-
+	if isinstance(vars[0], AutoDiffXd):
+		if not autoDiffArrayEqual(v, plant.GetVelocities()):
 
  """
  The little-dog example:

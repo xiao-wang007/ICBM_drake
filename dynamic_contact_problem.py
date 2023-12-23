@@ -16,6 +16,7 @@ from pydrake.all import (
     AddUnitQuaternionConstraintOnPlant, PositionConstraint, OrientationConstraint
     )
 import numpy as np
+from functools import partial
 
 """
 a function to return the scene with context and plant.
@@ -26,17 +27,25 @@ a function to return the scene with context and plant.
 
 """
 Contact data containers
+
+Need to use a class to contain the contact pairs.
+
+Dict as data holder 
+Namedtuple as dict values
+class methods to get some utilities.
+
 """
+
+
 from collections import OrderedDict, namedtuple
 ContactPairs = namedtuple("ContactPairs", "bodyA, bodyB, pts_in_A, pts_in_B, \
-						   nhat_BA_W_list, v_tang_ACb_W_list, contact_wrenches_W")
+						   nhat_BA_W_list, v_tang_ACb_W_list")
 
 conPairs["h-obj"] = ContactPairs("panda_rightfinger", \
                                  "base_link_cracker", \
                                  [np.array([[0.1],[0.1],[0.1]])], \
                                  [np.array([[0.2],[0.2],[0.2]])], \
                                  [np.array([[0],[0],[1]])], \
-                                 [], \
                                  [])
 
 conPairs["obj-env"] = ContactPairs("base_link_cracker", \
@@ -44,7 +53,6 @@ conPairs["obj-env"] = ContactPairs("base_link_cracker", \
                                    [np.array([[0.1],[0.1],[0.1]])], \
                                    [np.array([[0.2],[0.2],[0.2]])], \
                                    [np.array([[1],[0],[1]])], \
-                                   [], \
                                    [])
 
 """
@@ -80,12 +88,13 @@ def AutoDiffArrayEqual(self, a, b):
 """
 
 class Push3D(object):
-	def __init__(self, stepSize, nStep, tabelFile, \
+	def __init__(self, T, nStep, tabelFile, \
 				 pandaFile, boxFile, tipFile=None, \
 				 X_W_table=None, X_table_pandaBase=None):
 		self.builder = DiagramBuilder()
 		self.N = nStep
-		self.plant, self.scene_graph = AddMultibodyPlantSceneGraph(self.builder, time_step=stepSize)
+		self.h = T/nStep
+		self.plant, self.scene_graph = AddMultibodyPlantSceneGraph(self.builder, time_step=self.h)
 		self.modelInstances = {"table_top" : parser.AddModels(tableFile)[0], \
 							   "panda"     : parser.AddModels(pandaFile)[0], \
 							   "box"       : parser.AddModels(boxFile)[0],
@@ -167,24 +176,24 @@ class Push3D(object):
 		# as well as just visualize the scene at a time point
 		pass
 
-	def SetConstraints(self, cst_list):
+	def SetSystemDynamicConstraint(self, conPairsDict):
 		"""
 		"Note! The solver side expects a flattened vector, not 2D decVars"
-		
-		:param      cst_list:  The cst list
-		:type       cst_list:  { type_description }
 		"""
-		for cst in cst_list:
-			self.prog.AddConstraint(cst, lb=cst.lb, ub=cst.ub, vars=)
+		# adding defect constraints 
+		for i in range(self.N-1):
+			self.prog.AddConstraint(partial(self.SystemDynamicConstraint, \
+								    context_index=i, conPairsDict=conPairsDict), \
+									lb=[0]*self.nv, \
+									ub=[0]*self.nv,\
+									vars=np.concatenate(self.vVars[:, i], \
+														self.qVars[:, i+1],
+														self.vVars[:, i+1],
+														self.uVars[:, i+1],
+														self.contactVars[:, i+1]))
 
-	def SetObjective(self, indices):
-		"""
-		"Assuming we are using Drake's .solvers.Cost()"
-		
-		:param      objFunction:  The object function
-		:type       objFunction:  { type_description }
-		"""
-		self.prog.AddCost(objFunction, vars=self.decVars[indices])
+	def SetObjective(self):
+		pass
 
 	def Solve(self, decVar_init=None):
 		if decVar_init is not None:
@@ -192,7 +201,7 @@ class Push3D(object):
 		else:
 			pass # zeros init
 
-    def SystemDynamicConstraint(self, vars, context_index, conPairs):
+    def SystemDynamicConstraint(self, vars, context_index, conPairsDict):
     	v, q_next, v_next, u_next, lambdasAndSlack_next = np.split(vars, \
     					[self.nv, self.nv+self.nq, self.nq+self.nv+self.nv, self.nq+self.nv+self.nv+self.nu])
     	if isinstance(vars[0], AutoDiffXd):
@@ -215,16 +224,99 @@ class Push3D(object):
 			M_next = self.ad_plant.CalcMassMatrixViaInverseDynamics(self.mutable_context_list[context_index+1])
 
 			# now loop to get contact Jacobians
-			for 
-				Jv_V_W_Cbox = eval_plant.CalcJacobianSpatialVelocity(eval_plant_context, 
+			for key, value in conPairDict:
+				if key is not "obj-env":
+					for i, (pt_in_A, pt_in_B) in zip(value.pts_in_A, value.pts_in_B):
+						Jv_V_W_Ca = self.ad_plant.CalcJacobianSpatialVelocity( \
+													  self.mutable_context_list[context_index], 
                                                       JacobianWrtVariable.kV, 
-                                                      frame_box, 
-                                                      p_in_box, 
+                                                      self.ad_plant.GetFrameByName(value.bodyA), 
+                                                      p_in_A, 
+                                                      eval_plant.world_frame(), 
+                                                      eval_plant.world_frame())
+						Jv_V_W_Cb = self.ad_plant.CalcJacobianSpatialVelocity( \
+													  self.mutable_context_list[context_index], 
+                                                      JacobianWrtVariable.kV, 
+                                                      self.ad_plant.GetFrameByName(value.bodyB), 
+                                                      p_in_B, 
+                                                      eval_plant.world_frame(), 
+                                                      eval_plant.world_frame())
+						v_tang_ACb_W = self.ComputeContactTangentialVelocity(context_index, \
+																			 value.bodyA, \
+																			 value.bodyB, \
+																			 pt_in_B, \
+																			 value.nhat_BA_W)
+						F_AB_W = self.ContactWrenchEvaluator(lambdasAndSlack_next[:-1], \
+															 value.nhat_BA_W, v_tang_ACb_W)
+						
+						y += Jv_V_W_Ca @ F_AB_W
+						y += Jv_V_W_Cb @ (-F_AB_W)
+				else:
+					for i, (pt_in_A, pt_in_B) in zip(value.pts_in_A, value.pts_in_B):
+						# only wrenches on the object is needed as table is fixed.
+						Jv_V_W_Ca = self.ad_plant.CalcJacobianSpatialVelocity( \
+													  self.mutable_context_list[context_index], 
+                                                      JacobianWrtVariable.kV, 
+                                                      self.ad_plant.GetFrameByName(value.bodyA), 
+                                                      p_in_A, 
                                                       eval_plant.world_frame(), 
                                                       eval_plant.world_frame())
 
+						v_tang_ACb_W = self.ComputeContactTangentialVelocity(context_index, \
+																			 value.bodyA, \
+																			 value.bodyB, \
+																			 pt_in_B, \
+																			 value.nhat_BA_W)
+						F_AB_W = self.ContactWrenchEvaluator(lambdasAndSlack_next[:-1], \
+															 value.nhat_BA_W, v_tang_ACb_W)
+
+						y += Jv_V_W_Ca @ F_AB_W # the wrench of A applied to B in expressed in {W}
+
+			y = y * self.h - M_next @ (v_next - v)
+		
 		else:
+			# here goes a version for float datatype
 			pass
+
+	def ContactWrenchEvaluator(self, lambdas, nhat_BA_W, v_tang_ACb_W):
+		# get the tangential velocity unit vector
+		vhat_tang_ACb_W = v_tang_ACb_W/np.linalg.norm(v_tang_ACb_W)
+		wrench = np.zeros((6, 1))
+		angles = np.linspace(0, 360, lambdas.size-1) # exclude the lambdaN
+        for i, ang in enumerate(angles):
+            rot = np.array([[np.cos(ang), -np.sin(ang)],
+                            [np.sin(ang),  np.cos(ang)]])
+            wrench[3:] += (rot @ vhat_tang_ACb_W) * lambdas[i+1]
+
+        wrench[3:] += lambdas[0] * nhat_BA_W  # contact normal
+		return wrench
+
+	def ComputeContactTangentialVelocity(self, context_index, bodyA, bodyB, ptB, nhat_BA_W):
+		frameA = self.ad_plant.GetFrameByName(bodyA)
+		frameB = self.ad_plant.GetFrameByName(bodyB)
+		V_AB_W = frameB.CalcSpatialVelocity(self.mutable_context_list[context_index], \
+                                                    frameA, \
+                                                    plant.world_frame())
+		R_w_B = self.ad_plant.CalcRelativeTransform(self.mutable_context_list[context_index], \
+                                                    plant.world_frame(), \
+                                                    frameB).rotation() # DCM from body B pose in {W}
+		p_BCb_W = R_w_B @ ptB # the contact points in {B} expressed in {W}
+		v_ACb_W = V_AB_w.shift(p_BCb_W).translational() # compute the contact point's velocity in {A}
+        v_tang_ACb_W = v_ACb_W - np.dot(v_ACb_W, nhat_BA_W) * nhat_BA_W
+        return v_tang_ACb_W
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 """
 To be used to get the system input, i.e. torques

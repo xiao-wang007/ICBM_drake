@@ -39,21 +39,21 @@ class methods to get some utilities.
 
 from collections import OrderedDict, namedtuple
 ContactPairs = namedtuple("ContactPairs", "bodyA, bodyB, pts_in_A, pts_in_B, \
-						   nhat_BA_W_list, v_tang_ACb_W_list")
+						   nhat_BA_W_list, miu")
 
 conPairs["h-obj"] = ContactPairs("panda_rightfinger", \
                                  "base_link_cracker", \
                                  [np.array([[0.1],[0.1],[0.1]])], \
                                  [np.array([[0.2],[0.2],[0.2]])], \
                                  [np.array([[0],[0],[1]])], \
-                                 [])
+                                 0.5)
 
 conPairs["obj-env"] = ContactPairs("base_link_cracker", \
                                    "table_top_link", \
                                    [np.array([[0.1],[0.1],[0.1]])], \
                                    [np.array([[0.2],[0.2],[0.2]])], \
                                    [np.array([[1],[0],[1]])], \
-                                   [])
+                                   0.5)
 
 """
 init the prog and setting decision variable
@@ -171,6 +171,12 @@ class Push3D(object):
 			self.qVars[:, -1], self.vVars[:, -1], self.uVars[:, -1], self.contactVars[:, -1] = \ 
 			np.split(decVars_tf, [self.nq, self.nq+self.nv, self.nq+self.nv+self.nContactParams])
 
+	def GetnContact(self, conPairsDict):
+		nContact = 0
+		for key in conPairsDict:
+			nContact += len(conPairsDict[key].pts_in_A)
+		return nContact
+
 	def SceneVisualizer(self, context_index=None):
 		# this is intended for visualization of the trajectory
 		# as well as just visualize the scene at a time point
@@ -201,9 +207,15 @@ class Push3D(object):
 		else:
 			pass # zeros init
 
-    def SystemDynamicConstraint(self, vars, context_index, conPairsDict):
+    def SystemDynamicConstraint(self, vars, context_index, conPairsDict, nBasis):
+		nContact = self.GetnContact(conPairsDict)
     	v, q_next, v_next, u_next, lambdasAndSlack_next = np.split(vars, \
     					[self.nv, self.nv+self.nq, self.nq+self.nv+self.nv, self.nq+self.nv+self.nv+self.nu])
+
+    	# split the contact vars for each contact
+    	markPoints = [(nBasis+1+1)*i for i in range(1, nContact)]
+    	lambdasAndSlack_set = [np.split(lambdasAndSlack_next, markPoints)]
+
     	if isinstance(vars[0], AutoDiffXd):
 			if not autoDiffArrayEqual(v, self.ad_plant.GetVelocities(self.mutable_context_list[context_index])):
 				self.ad_plant.SetVelocities(self.mutable_context_list[context_index], v)
@@ -224,6 +236,7 @@ class Push3D(object):
 			M_next = self.ad_plant.CalcMassMatrixViaInverseDynamics(self.mutable_context_list[context_index+1])
 
 			# now loop to get contact Jacobians
+			counter = 0
 			for key, value in conPairDict:
 				if key is not "obj-env":
 					for i, (pt_in_A, pt_in_B) in zip(value.pts_in_A, value.pts_in_B):
@@ -246,11 +259,15 @@ class Push3D(object):
 																			 value.bodyB, \
 																			 pt_in_B, \
 																			 value.nhat_BA_W)
-						F_AB_W = self.ContactWrenchEvaluator(lambdasAndSlack_next[:-1], \
+
+						# need the offset the number of contact parameters each time
+						F_AB_W = self.ContactWrenchEvaluator(lambdasAndSlack_set[counter][:-1], \
 															 value.nhat_BA_W, v_tang_ACb_W)
 						
 						y += Jv_V_W_Ca @ F_AB_W
 						y += Jv_V_W_Cb @ (-F_AB_W)
+						counter += 1
+					
 				else:
 					for i, (pt_in_A, pt_in_B) in zip(value.pts_in_A, value.pts_in_B):
 						# only wrenches on the object is needed as table is fixed.
@@ -267,13 +284,15 @@ class Push3D(object):
 																			 value.bodyB, \
 																			 pt_in_B, \
 																			 value.nhat_BA_W)
-						F_AB_W = self.ContactWrenchEvaluator(lambdasAndSlack_next[:-1], \
+						F_AB_W = self.ContactWrenchEvaluator(lambdasAndSlack_next[counter][:-1], \
 															 value.nhat_BA_W, v_tang_ACb_W)
 
 						y += Jv_V_W_Ca @ F_AB_W # the wrench of A applied to B in expressed in {W}
+						counter += 1
 
+			counter = 0
 			y = y * self.h - M_next @ (v_next - v)
-		
+			
 		else:
 			# here goes a version for float datatype
 			pass
@@ -304,6 +323,44 @@ class Push3D(object):
 		v_ACb_W = V_AB_w.shift(p_BCb_W).translational() # compute the contact point's velocity in {A}
         v_tang_ACb_W = v_ACb_W - np.dot(v_ACb_W, nhat_BA_W) * nhat_BA_W
         return v_tang_ACb_W
+
+    def SlidingConatactConstraint_LCP(self, vars, context_index, conPairsDict, nBasis):
+    	"""
+    	It is important to note the relative indexing of the complementarity and dynamical constraints. 
+    	Over the interval [tk,tk+1], the contact impulse can be non-zero if and only if φ(qk+1) = 0; 
+    	that is, the bodies must be in contact at the end of the given interval.
+    	"""
+    	nContact = self.GetnContact(conPairsDict)
+    	q, v, lambdasAndSlack = np.split(vars, [self.nq, self.nq+self.nv])
+
+    	# split the contact vars for each contact
+    	markPoints = [(nBasis+1+1)*i for i in range(1, nContact)]
+    	lambdasAndSlack_set = [np.split(lambdasAndSlack, markPoints)]
+
+    	if isinstance(vars[0], AutoDiffXd):
+			if not autoDiffArrayEqual(v, self.ad_plant.GetVelocities(self.mutable_context_list[context_index])):
+				self.ad_plant.SetVelocities(self.mutable_context_list[context_index], v)
+			if not autoDiffArrayEqual(q, self.ad_plant.GetPositions(self.mutable_context_list[context_index])):
+				self.ad_plant.SetPositions(self.mutable_context_list[context_index], q)
+
+    	# signed distance between hand and object
+    	counter = 0
+    	signedDistances = [] # phi(q)
+    	frictionCone = [] # miu*fn - sum(all lambdas on basis)
+    	for key, value in conPairDict:
+			frameA = self.ad_plant.GetFrameByName(value.bodyA)
+			X_WA = frameA.CalcPoseInWorld(self.mutable_context_list[context_index])
+			X_WB = frameB.CalcPoseInWorld(self.mutable_context_list[context_index])
+			for i, (ptA, ptB) in enumerate(value.pts_in_A, value.pts_in_B):
+				pA_in_W = X_WA @ value.pts_in_A[i]
+				pB_in_W = X_WB @ value.pts_in_B[i]
+				signedDistances.append(pA_in_W - pB_in_W)
+
+				# frictional cone
+				frictionCone.append(value.miu*lambdasAndSlack_set[counter][0] - \
+								    (np.sum(lambdasAndSlack_set[counter][1:-1])))
+
+				# onto eq(15-16) in posa paper, relative tangential velocity
 
 
 

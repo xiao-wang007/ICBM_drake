@@ -12,10 +12,16 @@ class SlidingContactConstraintLCP(object):
     	markPoints = [(nBasis+1+1)*i for i in range(1, nContact)]
     	self.lambdasAndSlack_set = [np.split(lambdasAndSlack, markPoints)]
 
+    	# unpack contact parameters
+    	self.lambdaNs = np.array([self.lambdasAndSlack_set[i][0] for i in range(len(self.lambdasAndSlack_set))])
+    	self.lambdats = np.array([self.lambdasAndSlack_set[i][1:-1] for i in range(len(self.lambdasAndSlack_set))]).flatten()
+    	self.slacks = np.array([self.lambdasAndSlack_set[i][-1] for i in range(len(self.lambdasAndSlack_set))])
+
 		# the components needed for LCP
 		self.signedDistance_set = [] # phi(q)
-    	self.frictionCone = [] # miu*fn - sum(all lambdas on basis)
     	self.v_tang_ACb_W_set = []
+    	self.frictionConeCst = [] # miu*fn - sum(all lambdas on basis)
+    	self.tangentialVelocityCst = np.zeros(self.nBasis * self.GetnContact(conPairsDict)) # slack + Phi.dot(D)
 
     	""" the cone basis for each contact
     		from list to numpy, the shape will be [nc, nbasis, 3] """
@@ -23,6 +29,10 @@ class SlidingContactConstraintLCP(object):
 
     	# call the computation
     	self.ComputeComponents()
+
+    	self.eq_cst1 = np.zeros(self.GetnContact(conPairsDict)) # of size (nc,)
+    	self.eq_cst2 = np.zeros(self.GetnContact(conPairsDict)) # of size (nc,)
+    	self.eq_cst3 = np.zeros(self.nBasis * self.GetnContact(conPairsDict)) # of size (nBasis*nc,)
 
     def GetnContact(self, conPairsDict):
 		nContact = 0
@@ -53,10 +63,12 @@ class SlidingContactConstraintLCP(object):
 			for i, (ptA, ptB) in enumerate(value.pts_in_A, value.pts_in_B):
 				pA_in_W = X_WA @ value.pts_in_A[i]
 				pB_in_W = X_WB @ value.pts_in_B[i]
-				self.signedDistance_set.append(pA_in_W - pB_in_W)
+				lineAB_W = pA_in_W - pB_in_W 
+				distance = np.sqrt(np.sum(lineAB_W * lineAB_W))
+				self.signedDistance_set.append(distance)
 
 				# frictional cone, eq(31)
-				self.frictionCone.append(value.miu*self.lambdasAndSlack_set[counter][0] - \
+				self.frictionConeCst.append(value.miu*self.lambdasAndSlack_set[counter][0] - \
 								    (np.sum(self.lambdasAndSlack_set[counter][1:-1])))
 
 				# onto eq(15-16) in posa paper, relative tangential velocity
@@ -69,8 +81,11 @@ class SlidingContactConstraintLCP(object):
 				v_tang_ACb_W_set.append(v_tang_ACb_W_i)
 				cone_set.append(self.ComputeConeBasis(v_tang_ACb_W_i))
 				counter += 1
-
 		counter = 0
+
+		self.signedDistance_set = np.array(self.signedDistance_set)
+		self.frictionConeCst = np.array(self.frictionConeCst)
+		self.ComputetangentialVelocityCst()
 
 	def ComputeContactTangentialVelocity(self, bodyA, bodyB, ptB, nhat_BA_W):
 		frameA = self.plant.GetFrameByName(bodyA)
@@ -104,20 +119,42 @@ class SlidingContactConstraintLCP(object):
     			mius.append(value.miu)
     	return np.array(miu)
 
-    def LCPEqualityConstraint(self):
+    def ComputetangentialVelocityCst(self):
+    	for i in range(len(self.cone_set)): # loop through each contact
+    		for j in range(self.nBasis):
+    			self.tangentialVelocityCst[i*self.nBasis + j] = \
+    				self.slacks[i] + np.dot(self.v_tang_ACb_W_set[i], self.cone_set[i][j])
+
+    def LCPEqualityConstraints(self):
+    	"""
+    	implements eq(13), eq(33), eq(34) in Posa paper
+    	"""
+
     	# Eq(13): phi(q) dot lambda = 0
-    	lambdaNs = np.array([self.lambdasAndSlack_set[i][0] for i in range(len(self.lambdasAndSlack_set))])
-    	eq_Cst1 = np.dot(np.array(self.signedDistance_set), lambdaNs)
+    	self.eq_cst1 = np.dot(self.signedDistance_set, self.lambdaNs)
 
     	# Eq(33): cone constraint
     	# mius = self.MiuVecForCone()
-    	slacks = np.array([self.lambdasAndSlack_set[i][-1] for i in range(len(self.lambdasAndSlack_set))])
+    	self.eq_cst2 = np.array(self.frictionConeCst) * self.slacks # elementwise
     	# tangLambdasSums = np.array([np.sum(self.lambdasAndSlack_set[i][1:-1]) for i in range(len(self.lambdasAndSlack_set))])
-    	# eq_Cst2 = np.dot(mius * lambdaNs - tangLambdasSums, \
+    	# eq_est2 = np.dot(mius * lambdaNs - tangLambdasSums, \
     	# 				slacks)
-    	eq_Cst2 = np.array(self.frictionCone) * slacks
+    	
+    	# Eq(34): sliding, this may be vectorized??
+    	# reshaped = self.cone_set.reshape(self.cone_set.shape[0]*self.cone_set.shape[1], self.cone_set.shape[2])
+    	eq_cst3 = self.tangentialVelocityCst * self.lambdats # element-wise
 
-    	# Eq(34): sliding
-    	reshaped = self.cone_set.reshape(self.cone_set.shape[0]*self.cone_set.shape[1], self.cone_set.shape[2])
-    	using np.einsum to vectorize this calculation!!!!
+    	return np.concatenate((eq_cst1, eq_cst2, eq_cst3))
+
+    def LCPInequalityConstraints(self):
+    	""" 
+    	implements eq(8), eq(31), eq(32) in Posa paper
+    	           but eq(9), eq(30) are enforced directly on solver side
+    	"""
+    	return np.concatenate((self.signedDistance_set, self.frictionConeCst, self.tangentialVelocityCst))
+
+    
+    	
+
+    	
 

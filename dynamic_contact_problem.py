@@ -297,6 +297,18 @@ class Push3D(object):
 			# here goes a version for float datatype
 			pass
 
+	def ComputeConeBasis(self, v_tang_ACb_W):
+		vhat_tang_ACb_W = v_tang_ACb_W/np.linalg.norm(v_tang_ACb_W)
+		wrench = np.zeros((6, 1))
+		angles = np.linspace(0, 360, lambdas.size-1) # exclude the lambdaN
+		basis = []
+        for i, ang in enumerate(angles):
+            rot = np.array([[np.cos(ang), -np.sin(ang)],
+                            [np.sin(ang),  np.cos(ang)]])
+            basis.append(rot @ vhat_tang_ACb_W)
+        return
+
+
 	def ContactWrenchEvaluator(self, lambdas, nhat_BA_W, v_tang_ACb_W):
 		# get the tangential velocity unit vector
 		vhat_tang_ACb_W = v_tang_ACb_W/np.linalg.norm(v_tang_ACb_W)
@@ -311,6 +323,20 @@ class Push3D(object):
 		return wrench
 
 	def ComputeContactTangentialVelocity(self, context_index, bodyA, bodyB, ptB, nhat_BA_W):
+		"""
+		"NOTE: ptB and nhat_BA_W are expected to be 1D vector, i,e (3,)"
+		
+		:param      context_index:  The context index
+		:type       context_index:  { type_description }
+		:param      bodyA:          The body a
+		:type       bodyA:          { type_description }
+		:param      bodyB:          The body b
+		:type       bodyB:          { type_description }
+		:param      ptB:            The point b
+		:type       ptB:            { type_description }
+		:param      nhat_BA_W:      The nhat ba w
+		:type       nhat_BA_W:      { type_description }
+		"""
 		frameA = self.ad_plant.GetFrameByName(bodyA)
 		frameB = self.ad_plant.GetFrameByName(bodyB)
 		V_AB_W = frameB.CalcSpatialVelocity(self.mutable_context_list[context_index], \
@@ -320,48 +346,64 @@ class Push3D(object):
                                                     plant.world_frame(), \
                                                     frameB).rotation() # DCM from body B pose in {W}
 		p_BCb_W = R_w_B @ ptB # the contact points in {B} expressed in {W}
-		v_ACb_W = V_AB_w.shift(p_BCb_W).translational() # compute the contact point's velocity in {A}
+		v_ACb_W = V_AB_W.Shift(p_BCb_W).translational() # compute the contact point's velocity in {A}
         v_tang_ACb_W = v_ACb_W - np.dot(v_ACb_W, nhat_BA_W) * nhat_BA_W
         return v_tang_ACb_W
 
-    def SlidingConatactConstraint_LCP(self, vars, context_index, conPairsDict, nBasis):
-    	"""
-    	It is important to note the relative indexing of the complementarity and dynamical constraints. 
-    	Over the interval [tk,tk+1], the contact impulse can be non-zero if and only if φ(qk+1) = 0; 
-    	that is, the bodies must be in contact at the end of the given interval.
-    	"""
-    	nContact = self.GetnContact(conPairsDict)
-    	q, v, lambdasAndSlack = np.split(vars, [self.nq, self.nq+self.nv])
+    # def SlidingConatactConstraint_LCP(self, vars, context_index, conPairsDict, nBasis):
+    # 	"""
+    # 	It is important to note the relative indexing of the complementarity and dynamical constraints. 
+    # 	Over the interval [tk,tk+1], the contact impulse can be non-zero if and only if φ(qk+1) = 0; 
+    # 	that is, the bodies must be in contact at the end of the given interval.
+    # 	"""
+    # 	nContact = self.GetnContact(conPairsDict)
+    # 	q, v, lambdasAndSlack = np.split(vars, [self.nq, self.nq+self.nv])
 
-    	# split the contact vars for each contact
-    	markPoints = [(nBasis+1+1)*i for i in range(1, nContact)]
-    	lambdasAndSlack_set = [np.split(lambdasAndSlack, markPoints)]
+    # 	# split the contact vars for each contact
+    # 	markPoints = [(nBasis+1+1)*i for i in range(1, nContact)]
+    # 	lambdasAndSlack_set = [np.split(lambdasAndSlack, markPoints)]
 
-    	if isinstance(vars[0], AutoDiffXd):
-			if not autoDiffArrayEqual(v, self.ad_plant.GetVelocities(self.mutable_context_list[context_index])):
-				self.ad_plant.SetVelocities(self.mutable_context_list[context_index], v)
-			if not autoDiffArrayEqual(q, self.ad_plant.GetPositions(self.mutable_context_list[context_index])):
-				self.ad_plant.SetPositions(self.mutable_context_list[context_index], q)
+    # 	if isinstance(vars[0], AutoDiffXd):
+	# 		if not autoDiffArrayEqual(v, self.ad_plant.GetVelocities(self.mutable_context_list[context_index])):
+	# 			self.ad_plant.SetVelocities(self.mutable_context_list[context_index], v)
+	# 		if not autoDiffArrayEqual(q, self.ad_plant.GetPositions(self.mutable_context_list[context_index])):
+	# 			self.ad_plant.SetPositions(self.mutable_context_list[context_index], q)
 
-    	# signed distance between hand and object
-    	counter = 0
-    	signedDistances = [] # phi(q)
-    	frictionCone = [] # miu*fn - sum(all lambdas on basis)
-    	for key, value in conPairDict:
-			frameA = self.ad_plant.GetFrameByName(value.bodyA)
-			X_WA = frameA.CalcPoseInWorld(self.mutable_context_list[context_index])
-			X_WB = frameB.CalcPoseInWorld(self.mutable_context_list[context_index])
-			for i, (ptA, ptB) in enumerate(value.pts_in_A, value.pts_in_B):
-				pA_in_W = X_WA @ value.pts_in_A[i]
-				pB_in_W = X_WB @ value.pts_in_B[i]
-				signedDistances.append(pA_in_W - pB_in_W)
+    # 	# signed distance between hand and object
+    # 	counter = 0
+    # 	signedDistance_set = [] # phi(q)
+    # 	frictionCone = [] # miu*fn - sum(all lambdas on basis)
+    # 	v_tang_ACb_W_set = []
 
-				# frictional cone
-				frictionCone.append(value.miu*lambdasAndSlack_set[counter][0] - \
-								    (np.sum(lambdasAndSlack_set[counter][1:-1])))
+    # 	""" the cone basis for each contact
+    # 		from list to numpy, the shape will be [nc, nbasis, 3] """
+    # 	cones_set = [] # this is [ [[x,y,z]_1,...,[]_6]_1, []_2, ..., []_nc]
 
-				# onto eq(15-16) in posa paper, relative tangential velocity
+    # 	# compute tangential velocities and cone basis for each contact
+    # 	for key, value in conPairDict:
+	# 		frameA = self.ad_plant.GetFrameByName(value.bodyA)
+	# 		X_WA = frameA.CalcPoseInWorld(self.mutable_context_list[context_index])
+	# 		X_WB = frameB.CalcPoseInWorld(self.mutable_context_list[context_index])
+	# 		for i, (ptA, ptB) in enumerate(value.pts_in_A, value.pts_in_B):
+	# 			pA_in_W = X_WA @ value.pts_in_A[i]
+	# 			pB_in_W = X_WB @ value.pts_in_B[i]
+	# 			signedDistance_set.append(pA_in_W - pB_in_W)
 
+	# 			# frictional cone, eq(31)
+	# 			frictionCone.append(value.miu*lambdasAndSlack_set[counter][0] - \
+	# 							    (np.sum(lambdasAndSlack_set[counter][1:-1])))
+
+	# 			# onto eq(15-16) in posa paper, relative tangential velocity
+	# 			""" This computation of the relative tangential velocity is a repetition! """
+	# 			v_tang_ACb_W_i = self.ComputeContactTangentialVelocity(context_index, \
+	# 												  value.bodyA, \
+	# 												  value.bodyB, \
+	# 												  pt_in_B, \
+	# 												  value.nhat_BA_W)
+	# 			v_tang_ACb_W_set.append(v_tang_ACb_W_i)
+	# 			cones_set.append(self.ComputeConeBasis(v_tang_ACb_W_i))
+
+	# 	# now enforce 
 
 
 

@@ -22,13 +22,6 @@ import numpy as np
 from functools import partial
 
 """
-a function to return the scene with context and plant.
-"""
-#
-
-
-
-"""
 Contact data containers
 
 Need to use a class to contain the contact pairs.
@@ -38,7 +31,6 @@ Namedtuple as dict values
 class methods to get some utilities.
 
 """
-
 
 from collections import OrderedDict, namedtuple
 ContactPairs = namedtuple("ContactPairs", "bodyA, bodyB, pts_in_A, pts_in_B, \
@@ -93,7 +85,7 @@ def AutoDiffArrayEqual(self, a, b):
 class Push3D(object):
     def __init__(self, T, nStep, tableFile, \
                  pandaFile, boxFile, tipFile=None, \
-                 X_W_table=None, X_table_pandaBase=None, visualize=False):
+                 X_W_table=None, X_table_pandaBase=None, X_table_box=None, visualize=False):
         self.builder = DiagramBuilder()
         self.isvisualized = visualize
         self.N = nStep
@@ -110,9 +102,9 @@ class Push3D(object):
                                "panda"     : self.parser.AddModels(pandaFile)[0], \
                                "box"       : self.parser.AddModels(boxFile)[0],
                                "tip"       : self.parser.AddModels(tipFile)[0]}
-        self.SetTheScene(X_W_table, X_table_pandaBase)
+        self.SetTheScene(X_W_table, X_table_pandaBase, X_table_box)
 
-    def SetTheScene(self, X_W_table, X_table_pandaBase):
+    def SetTheScene(self, X_W_table, X_table_pandaBase, X_table_box):
         table_top_frame = self.plant.GetFrameByName("table_top_center")
         robot_base_frame = self.plant.GetFrameByName("panda_link0")
         box_base_frame = self.plant.GetFrameByName("base_link_cracker")
@@ -135,9 +127,13 @@ class Push3D(object):
             ApplyVisualizationConfig(self.visualization_config, self.builder, meshcat=self.meshcat)
         self.diagram = self.builder.Build()
         self.diagram_context_list = [self.diagram.CreateDefaultContext() for i in range(self.N)]
-        self.mutable_plant_context_list = [self.plant.GetMyMutableContextFromRoot(context) for context in self.diagram_context_list]
+        self.mutable_plant_context_list = [self.plant.GetMyContextFromRoot(context) for context in self.diagram_context_list]
 
-        """ How to let ad diagram to co-exit with double diagram """
+        # set free body pose
+        boxBody = self.plant.GetBodyByName("base_link_cracker")
+        self.plant.SetFreeBodyPose(self.mutable_plant_context_list[0], boxBody, X_table_box)
+        
+        """ How to let ad diagram to co-exit with double diagram?? """
         # AutoDiff 
         # self.ad_diagram = self.diagram.ToAutoDiffXd()
         # self.ad_plant = self.ad_diagram.GetSubsystemByName("Push3D")
@@ -367,77 +363,18 @@ class Push3D(object):
         v_tang_ACb_W = v_ACb_W - np.dot(v_ACb_W, nhat_BA_W) * nhat_BA_W
         return v_tang_ACb_W
 
-    def SceneVisualizer(self):
+    def SceneVisualizer(self, context_index, jointPositions=None):
         # this is intended for visualization of the trajectory
         # as well as just visualize the scene at a time point
-        pass
-
-    # def SlidingConatactConstraint_LCP(self, vars, context_index, conPairsDict, nBasis):
-    #   """
-    #   It is important to note the relative indexing of the complementarity and dynamical constraints. 
-    #   Over the interval [tk,tk+1], the contact impulse can be non-zero if and only if φ(qk+1) = 0; 
-    #   that is, the bodies must be in contact at the end of the given interval.
-    #   """
-    #   nContact = self.GetnContact(conPairsDict)
-    #   q, v, lambdasAndSlack = np.split(vars, [self.nq, self.nq+self.nv])
-
-    #   # split the contact vars for each contact
-    #   markPoints = [(nBasis+1+1)*i for i in range(1, nContact)]
-    #   lambdasAndSlack_set = [np.split(lambdasAndSlack, markPoints)]
-
-    #   if isinstance(vars[0], AutoDiffXd):
-    #       if not autoDiffArrayEqual(v, self.ad_plant.GetVelocities(self.mutable_context_list[context_index])):
-    #           self.ad_plant.SetVelocities(self.mutable_context_list[context_index], v)
-    #       if not autoDiffArrayEqual(q, self.ad_plant.GetPositions(self.mutable_context_list[context_index])):
-    #           self.ad_plant.SetPositions(self.mutable_context_list[context_index], q)
-
-    #   # signed distance between hand and object
-    #   counter = 0
-    #   signedDistance_set = [] # phi(q)
-    #   frictionCone = [] # miu*fn - sum(all lambdas on basis)
-    #   v_tang_ACb_W_set = []
-
-    #   """ the cone basis for each contact
-    #       from list to numpy, the shape will be [nc, nbasis, 3] """
-    #   cones_set = [] # this is [ [[x,y,z]_1,...,[]_6]_1, []_2, ..., []_nc]
-
-    #   # compute tangential velocities and cone basis for each contact
-    #   for key, value in conPairDict:
-    #       frameA = self.ad_plant.GetFrameByName(value.bodyA)
-    #       X_WA = frameA.CalcPoseInWorld(self.mutable_context_list[context_index])
-    #       X_WB = frameB.CalcPoseInWorld(self.mutable_context_list[context_index])
-    #       for i, (ptA, ptB) in enumerate(value.pts_in_A, value.pts_in_B):
-    #           pA_in_W = X_WA @ value.pts_in_A[i]
-    #           pB_in_W = X_WB @ value.pts_in_B[i]
-    #           signedDistance_set.append(pA_in_W - pB_in_W)
-
-    #           # frictional cone, eq(31)
-    #           frictionCone.append(value.miu*lambdasAndSlack_set[counter][0] - \
-    #                               (np.sum(lambdasAndSlack_set[counter][1:-1])))
-
-    #           # onto eq(15-16) in posa paper, relative tangential velocity
-    #           """ This computation of the relative tangential velocity is a repetition! """
-    #           v_tang_ACb_W_i = self.ComputeContactTangentialVelocity(context_index, \
-    #                                                 value.bodyA, \
-    #                                                 value.bodyB, \
-    #                                                 pt_in_B, \
-    #                                                 value.nhat_BA_W)
-    #           v_tang_ACb_W_set.append(v_tang_ACb_W_i)
-    #           cones_set.append(self.ComputeConeBasis(v_tang_ACb_W_i))
-
-    #   # now enforce 
-
-
-
-
-
-
-
-
-
-
-
-
+        if jointPositions is not None:
+            plant_context_ti = self.mutable_plant_context_list[context_index]
+            self.plant.SetPositions(plant_context_ti, self.modelInstances["panda"], jointPositions)
+            self.plant.get_actuation_input_port().FixValue(plant_context_ti, np.zeros(9))
+            self.diagram.ForcedPublish(self.diagram_context_list[context_index]) # publish the corresponding diagram
+        else: 
+            plant_context_ti = self.mutable_plant_context_list[context_index]
+            self.plant.get_actuation_input_port().FixValue(plant_context_ti, np.zeros(9))
+            self.diagram.ForcedPublish(self.diagram_context_list[context_index]) # publish the corresponding diagram
 
 """
 To be used to get the system input, i.e. torques

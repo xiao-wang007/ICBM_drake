@@ -15,6 +15,9 @@ from pydrake.all import (
     eq, ge,  AutoDiffXd, SnoptSolver, IpoptSolver,  
     AddUnitQuaternionConstraintOnPlant, PositionConstraint, OrientationConstraint
     )
+from pydrake.geometry import (MeshcatVisualizer, StartMeshcat)
+from pydrake.visualization import (VisualizationConfig, ApplyVisualizationConfig, AddDefaultVisualization)
+
 import numpy as np
 from functools import partial
 
@@ -88,17 +91,25 @@ def AutoDiffArrayEqual(self, a, b):
 """
 
 class Push3D(object):
-    def __init__(self, T, nStep, tabelFile, \
+    def __init__(self, T, nStep, tableFile, \
                  pandaFile, boxFile, tipFile=None, \
-                 X_W_table=None, X_table_pandaBase=None):
+                 X_W_table=None, X_table_pandaBase=None, visualize=False):
         self.builder = DiagramBuilder()
+        self.isvisualized = visualize
         self.N = nStep
         self.h = T/nStep
         self.plant, self.scene_graph = AddMultibodyPlantSceneGraph(self.builder, time_step=self.h)
-        self.modelInstances = {"table_top" : parser.AddModels(tableFile)[0], \
-                               "panda"     : parser.AddModels(pandaFile)[0], \
-                               "box"       : parser.AddModels(boxFile)[0],
-                               "tip"       : parser.AddModels(tipFile)[0]}
+        self.parser = Parser(self.plant)
+
+        if tipFile == None:
+            self.modelInstances = {"table_top" : self.parser.AddModels(tableFile)[0], \
+                                   "panda"     : self.parser.AddModels(pandaFile)[0], \
+                                   "box"       : self.parser.AddModels(boxFile)[0]}
+        else:
+            self.modelInstances = {"table_top" : self.parser.AddModels(tableFile)[0], \
+                               "panda"     : self.parser.AddModels(pandaFile)[0], \
+                               "box"       : self.parser.AddModels(boxFile)[0],
+                               "tip"       : self.parser.AddModels(tipFile)[0]}
         self.SetTheScene(X_W_table, X_table_pandaBase)
 
     def SetTheScene(self, X_W_table, X_table_pandaBase):
@@ -112,25 +123,33 @@ class Push3D(object):
             self.plant.WeldFrames(table_top_frame, robot_base_frame, X_table_pandaBase)
 
         self.plant.Finalize()
-        self.plant.set_name("Push3D")
+        # self.plant.set_name("Push3D")
 
         # Two versions: float
+        if self.isvisualized:
+            self.meshcat = StartMeshcat()
+            self.visualizer = MeshcatVisualizer.AddToBuilder(self.builder, self.scene_graph, self.meshcat)
+            self.visualization_config = VisualizationConfig()
+            self.visualization_config.publish_contacts = True
+            self.visualization_config.publish_proximity = True
+            ApplyVisualizationConfig(self.visualization_config, self.builder, meshcat=self.meshcat)
         self.diagram = self.builder.Build()
-        self.mutable_context_list = [self.plant.CreateDefaultContext() for i in range(self.N)]
-        # AutoDiff
-        self.ad_diagram = self.diagram.ToAutoDiffXd()
-        self.ad_plant = self.ad_diagram.GetSubsystemByName("Push3D")
-        self.ad_mutable_context_list = [self.ad_plant.CreateDefaultContext() for i in range(self.N)]
+        self.diagram_context_list = [self.diagram.CreateDefaultContext() for i in range(self.N)]
+        self.mutable_plant_context_list = [self.plant.GetMyMutableContextFromRoot(context) for context in self.diagram_context_list]
+
+        """ How to let ad diagram to co-exit with double diagram """
+        # AutoDiff 
+        # self.ad_diagram = self.diagram.ToAutoDiffXd()
+        # self.ad_plant = self.ad_diagram.GetSubsystemByName("Push3D")
+        # self.ad_mutable_context_list = [self.ad_plant.CreateDefaultContext() for i in range(self.N)]
 
     def SetDevisionVariables(self, case, nContact, nBasis):
         self.prog = MathematicalProgram()
-        self.nDecVar_ti = nq + nv + nu + nContact*(nBasis+1+1) # the offset for indexing
-        nDecVar = (nq + nv + nu + nContact*(nBasis+1+1))*self.N
         self.nContactParams = nContact * (nBasis + 1 + 1)
 
         if case == "jointspace":
             # -2 is to offset the two fixed panda fingers
-            self.nq = self.plant.num_positions(self.modelInstances["panda"])    - 2 + \
+            self.nq = self.plant.num_positions(self.modelInstances["panda"]) - 2 + \
                  self.plant.num_positions(self.modelInstances["box"])
             self.nv = self.plant.num_velocities(self.modelInstances["panda"]) - 2 + \
                  self.plant.num_velocities(self.modelInstances["box"])
@@ -139,7 +158,7 @@ class Push3D(object):
             self.qVars = self.prog.NewContinuousVariables(self.nq, self.N, "positions")
             self.vVars = self.prog.NewContinuousVariables(self.nv, self.N, "velocities")
             self.uVars = self.prog.NewContinuousVariables(self.nu, self.N, "actuations")
-            self.contactVars = self.prog.NewContinuousVariables(self.nContactParams, N, "lambdas&slack")
+            self.contactVars = self.prog.NewContinuousVariables(self.nContactParams, self.N, "lambdas&slack")
             # 1 is for fn, 1 is for slack
 
         elif case == "taskspace":
@@ -152,7 +171,10 @@ class Push3D(object):
             self.qVars = self.prog.NewContinuousVariables(self.nq, self.N, "positions")
             self.vVars = self.prog.NewContinuousVariables(self.nv, self.N, "velocities")
             self.uVars = self.prog.NewContinuousVariables(self.nu, self.N, "actuations")
-            self.contactVars = self.prog.NewContinuousVariables(self.nContactParams, N, "lambdas&slack")
+            self.contactVars = self.prog.NewContinuousVariables(self.nContactParams, self.N, "lambdas&slack")
+
+        self.nDecVar_ti = self.nq + self.nv + self.nu + nContact*(nBasis+1+1) # the offset for indexing
+        self.nDecVar_all = (self.nq + self.nv + self.nu + nContact*(nBasis+1+1))*self.N
 
     def SetBoundaryConditions(self, decVars_t0, decVars_tf=None):
         """
@@ -176,11 +198,6 @@ class Push3D(object):
         for key in conPairsDict:
             nContact += len(conPairsDict[key].pts_in_A)
         return nContact
-
-    def SceneVisualizer(self, context_index=None):
-        # this is intended for visualization of the trajectory
-        # as well as just visualize the scene at a time point
-        pass
 
     def SetSystemDynamicConstraint(self, conPairsDict):
         """
@@ -349,6 +366,11 @@ class Push3D(object):
         v_ACb_W = V_AB_W.Shift(p_BCb_W).translational() # compute the contact point's velocity in {A}
         v_tang_ACb_W = v_ACb_W - np.dot(v_ACb_W, nhat_BA_W) * nhat_BA_W
         return v_tang_ACb_W
+
+    def SceneVisualizer(self):
+        # this is intended for visualization of the trajectory
+        # as well as just visualize the scene at a time point
+        pass
 
     # def SlidingConatactConstraint_LCP(self, vars, context_index, conPairsDict, nBasis):
     #   """

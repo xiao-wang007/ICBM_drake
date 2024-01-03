@@ -78,6 +78,39 @@ Some utility functions
 def AutoDiffArrayEqual(self, a, b):
     return np.array_equal(a, b) and np.array_equal(ExtractGradient(a), ExtractGradient(b))
 
+class SceneFactory(object):
+    def __init__(self, h, tableFile, pandaFile, boxFile, X_W_table, X_table_pandaBase, X_table_box, tipFile=None):
+        self.builder = DiagramBuilder()
+        self.plant, self.scene_graph = AddMultibodyPlantSceneGraph(self.builder, time_step=h)
+        self.parser = Parser(self.plant)
+
+        if tipFile == None:
+            self.modelInstances= {"table_top" : self.parser.AddModels(tableFile)[0], \
+                                   "panda"     : self.parser.AddModels(pandaFile)[0], \
+                                   "box"       : self.parser.AddModels(boxFile)[0]}
+        else:
+            self.modelInstances = {"table_top" : self.parser.AddModels(tableFile)[0], \
+                               "panda"     : self.parser.AddModels(pandaFile)[0], \
+                               "box"       : self.parser.AddModels(boxFile)[0],
+                               "tip"       : self.parser.AddModels(tipFile)[0]}
+
+        self.table_top_frame = self.plant.GetFrameByName("table_top_center")
+        self.robot_base_frame = self.plant.GetFrameByName("panda_link0")
+        self.box_base_frame = self.plant.GetFrameByName("base_link_cracker")
+
+        
+        self.plant.WeldFrames(self.plant.world_frame(), self.table_top_frame, X_W_table)
+        self.plant.WeldFrames(self.table_top_frame, self.robot_base_frame, X_table_pandaBase)
+        self.plant.WeldFrames(self.table_top_frame, self.box_base_frame, X_table_box)
+
+        self.plant.Finalize()
+        # self.plant.set_name("Push3D")
+
+        self.diagram = self.builder.Build()
+        self.diagram_context = self.diagram.CreateDefaultContext()
+        self.mutable_plant_context = self.plant.GetMyContextFromRoot(self.diagram_context)
+
+
 """
 "A class for the case"
 """
@@ -87,6 +120,10 @@ class Push3D(object):
                  pandaFile, boxFile, tipFile=None, \
                  X_W_table=None, X_table_pandaBase=None, X_table_box=None, visualize=False):
         self.builder = DiagramBuilder()
+        self.tableFile = tableFile
+        self.pandaFile = pandaFile
+        self.boxFile = boxFile
+        self.tipFile = tipFile
         self.isvisualized = visualize
         self.N = nStep
         self.h = T/nStep
@@ -94,25 +131,25 @@ class Push3D(object):
         self.parser = Parser(self.plant)
 
         if tipFile == None:
-            self.modelInstances = {"table_top" : self.parser.AddModels(tableFile)[0], \
-                                   "panda"     : self.parser.AddModels(pandaFile)[0], \
-                                   "box"       : self.parser.AddModels(boxFile)[0]}
+            self.modelInstances = {"table_top" : self.parser.AddModels(self.tableFile)[0], \
+                                   "panda"     : self.parser.AddModels(self.pandaFile)[0], \
+                                   "box"       : self.parser.AddModels(self.boxFile)[0]}
         else:
-            self.modelInstances = {"table_top" : self.parser.AddModels(tableFile)[0], \
-                               "panda"     : self.parser.AddModels(pandaFile)[0], \
-                               "box"       : self.parser.AddModels(boxFile)[0],
-                               "tip"       : self.parser.AddModels(tipFile)[0]}
+            self.modelInstances = {"table_top" : self.parser.AddModels(self.tableFile)[0], \
+                               "panda"     : self.parser.AddModels(self.pandaFile)[0], \
+                               "box"       : self.parser.AddModels(self.boxFile)[0],
+                               "tip"       : self.parser.AddModels(self.tipFile)[0]}
         self.SetTheScene(X_W_table, X_table_pandaBase, X_table_box)
 
     def SetTheScene(self, X_W_table, X_table_pandaBase, X_table_box):
-        table_top_frame = self.plant.GetFrameByName("table_top_center")
-        robot_base_frame = self.plant.GetFrameByName("panda_link0")
-        box_base_frame = self.plant.GetFrameByName("base_link_cracker")
+        self.table_top_frame = self.plant.GetFrameByName("table_top_center")
+        self.robot_base_frame = self.plant.GetFrameByName("panda_link0")
+        self.box_base_frame = self.plant.GetFrameByName("base_link_cracker")
 
         if X_W_table != None:
-            self.plant.WeldFrames(self.plant.world_frame(), table_top_frame, X_W_table)
+            self.plant.WeldFrames(self.plant.world_frame(), self.table_top_frame, X_W_table)
         if X_table_pandaBase != None:
-            self.plant.WeldFrames(table_top_frame, robot_base_frame, X_table_pandaBase)
+            self.plant.WeldFrames(self.table_top_frame, self.robot_base_frame, X_table_pandaBase)
 
         self.plant.Finalize()
         # self.plant.set_name("Push3D")
@@ -138,6 +175,13 @@ class Push3D(object):
         # self.ad_diagram = self.diagram.ToAutoDiffXd()
         # self.ad_plant = self.ad_diagram.GetSubsystemByName("Push3D")
         # self.ad_mutable_context_list = [self.ad_plant.CreateDefaultContext() for i in range(self.N)]
+    
+    def CreateSceneForInvKinProg(self, X_W_table, X_table_pandaBase, X_table_box):
+        """ create the same scene but weld the box as well, this is for testing the my own contacts 
+            This can be substituted by locking the joints in class pydrake.multibody.inverse_kinematics.InverseKinematics
+            using the overloaded constructor with Joint::Lock
+        """
+        return SceneFactory(self.h, self.tableFile, self.pandaFile, self.boxFile, X_W_table, X_table_pandaBase, X_table_box)
 
     def SetDevisionVariables(self, case, nContact, nBasis):
         self.prog = MathematicalProgram()
@@ -375,6 +419,7 @@ class Push3D(object):
             plant_context_ti = self.mutable_plant_context_list[context_index]
             self.plant.get_actuation_input_port().FixValue(plant_context_ti, np.zeros(9))
             self.diagram.ForcedPublish(self.diagram_context_list[context_index]) # publish the corresponding diagram
+
 
 """
 To be used to get the system input, i.e. torques
